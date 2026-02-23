@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -118,19 +117,12 @@ func ocrPDFWithProgress(
 		return
 	}
 
-	// Rasterize.
-	outputPrefix := filepath.Join(tmpDir, "page")
-	if err := rasterize(ctx, pdfPath, outputPrefix, maxPages); err != nil {
-		ch <- ExtractProgress{Err: fmt.Errorf("pdftoppm: %w", err), Done: true}
-		return
-	}
-
-	images, err := filepath.Glob(outputPrefix + "*.png")
+	// Acquire images: pdfimages → pdftohtml → pdftoppm.
+	images, acquireTool, err := acquireImages(ctx, pdfPath, tmpDir, maxPages)
 	if err != nil {
-		ch <- ExtractProgress{Err: fmt.Errorf("glob page images: %w", err), Done: true}
+		ch <- ExtractProgress{Err: err, Done: true}
 		return
 	}
-	sort.Strings(images)
 
 	if len(images) == 0 {
 		ch <- ExtractProgress{Done: true}
@@ -139,59 +131,50 @@ func ocrPDFWithProgress(
 
 	total := len(images)
 
-	// Send rasterize complete.
+	// Send image acquisition complete with the tool that produced them.
 	select {
-	case ch <- ExtractProgress{Phase: "rasterize", Page: total, Total: total}:
+	case ch <- ExtractProgress{Phase: acquireTool, Page: total, Total: total}:
 	case <-ctx.Done():
 		ch <- ExtractProgress{Err: ctx.Err(), Done: true}
 		return
 	}
 
-	// OCR each page.
-	var allText bytes.Buffer
-	var allTSV bytes.Buffer
-	headerWritten := false
+	// OCR pages in parallel with per-page progress.
+	pageDone := make(chan struct{}, total)
+	var results []ocrPageResult
+	done := make(chan struct{})
+	go func() {
+		results = ocrPagesParallel(ctx, images, pageDone)
+		close(done)
+	}()
 
-	for i, img := range images {
-		if ctx.Err() != nil {
-			ch <- ExtractProgress{Err: ctx.Err(), Done: true}
-			return
-		}
-
+	completed := 0
+	for completed < total {
 		select {
-		case ch <- ExtractProgress{Phase: "extract", Page: i + 1, Total: total}:
+		case <-pageDone:
+			completed++
+			select {
+			case ch <- ExtractProgress{Phase: "extract", Page: completed, Total: total}:
+			case <-ctx.Done():
+				<-done
+				ch <- ExtractProgress{Err: ctx.Err(), Done: true}
+				return
+			}
 		case <-ctx.Done():
+			<-done
 			ch <- ExtractProgress{Err: ctx.Err(), Done: true}
 			return
-		}
-
-		pageText, pageTSV, ocrErr := ocrImageFile(ctx, img)
-		if ocrErr != nil {
-			continue // skip pages that fail
-		}
-		if pageText != "" {
-			if allText.Len() > 0 {
-				allText.WriteString("\n\n")
-			}
-			allText.WriteString(pageText)
-		}
-		if len(pageTSV) > 0 {
-			lines := bytes.SplitN(pageTSV, []byte("\n"), 2)
-			if !headerWritten {
-				allTSV.Write(pageTSV)
-				headerWritten = true
-			} else if len(lines) > 1 {
-				allTSV.Write(lines[1])
-			}
 		}
 	}
+	<-done
 
+	text, tsv := collectOCRResults(results)
 	ch <- ExtractProgress{
 		Tool: "tesseract",
 		Desc: "Text recognized from rasterized page images.",
 		Done: true,
-		Text: normalizeWhitespace(allText.String()),
-		Data: allTSV.Bytes(),
+		Text: text,
+		Data: tsv,
 	}
 }
 

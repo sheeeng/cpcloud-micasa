@@ -5,6 +5,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -204,6 +205,54 @@ func TestChatCompleteSuccess(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "SELECT COUNT(*) FROM projects", result)
+}
+
+func TestChatCompleteWithJSONSchema(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		rf, ok := body["response_format"].(map[string]any)
+		require.True(t, ok, "request should include response_format")
+		assert.Equal(t, "json_schema", rf["type"])
+		js, ok := rf["json_schema"].(map[string]any)
+		require.True(t, ok, "response_format should include json_schema")
+		assert.Equal(t, "test_schema", js["name"])
+		schema, ok := js["schema"].(map[string]any)
+		require.True(t, ok, "json_schema should include schema")
+		assert.Equal(t, "object", schema["type"])
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`)
+	}))
+	defer srv.Close()
+
+	schema := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"ok": map[string]any{"type": "boolean"}},
+		"required":   []any{"ok"},
+	}
+	client := NewClient(srv.URL+"/v1", "test-model", testTimeout)
+	result, err := client.ChatComplete(context.Background(), []Message{
+		{Role: "user", Content: "extract"},
+	}, WithJSONSchema("test_schema", schema))
+	require.NoError(t, err)
+	assert.Contains(t, result, "ok")
+}
+
+func TestChatCompleteWithoutJSONSchema(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		_, hasRF := body["response_format"]
+		assert.False(t, hasRF, "request should not include response_format")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"hello"}}]}`)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL+"/v1", "test-model", testTimeout)
+	result, err := client.ChatComplete(context.Background(), []Message{
+		{Role: "user", Content: "hi"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "hello", result)
 }
 
 func TestChatCompleteServerError(t *testing.T) {

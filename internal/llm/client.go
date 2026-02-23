@@ -41,11 +41,39 @@ type StreamChunk struct {
 // --- OpenAI-compatible request/response types ---
 
 type chatRequest struct {
-	Model       string         `json:"model"`
-	Messages    []Message      `json:"messages"`
-	Stream      bool           `json:"stream"`
-	Temperature *float64       `json:"temperature,omitempty"`
-	Options     map[string]any `json:"options,omitempty"`
+	Model          string          `json:"model"`
+	Messages       []Message       `json:"messages"`
+	Stream         bool            `json:"stream"`
+	Temperature    *float64        `json:"temperature,omitempty"`
+	Options        map[string]any  `json:"options,omitempty"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+}
+
+type responseFormat struct {
+	Type       string      `json:"type"`
+	JSONSchema *jsonSchema `json:"json_schema,omitempty"`
+}
+
+type jsonSchema struct {
+	Name   string         `json:"name"`
+	Schema map[string]any `json:"schema"`
+}
+
+// ChatOption configures a chat completion request.
+type ChatOption func(*chatRequest)
+
+// WithJSONSchema constrains the model output to match the given JSON Schema.
+// Ollama's OpenAI-compatible endpoint maps this to the native format parameter.
+func WithJSONSchema(name string, schema map[string]any) ChatOption {
+	return func(r *chatRequest) {
+		r.ResponseFormat = &responseFormat{
+			Type: "json_schema",
+			JSONSchema: &jsonSchema{
+				Name:   name,
+				Schema: schema,
+			},
+		}
+	}
 }
 
 type chatCompletionChunk struct {
@@ -284,15 +312,20 @@ func (c *Client) Ping(ctx context.Context) error {
 func (c *Client) ChatComplete(
 	ctx context.Context,
 	messages []Message,
+	opts ...ChatOption,
 ) (string, error) {
 	temp := 0.0
-	body, err := json.Marshal(chatRequest{
+	cr := chatRequest{
 		Model:       c.model,
 		Messages:    messages,
 		Stream:      false,
 		Temperature: &temp,
 		Options:     c.requestOptions(),
-	})
+	}
+	for _, opt := range opts {
+		opt(&cr)
+	}
+	body, err := json.Marshal(cr)
 	if err != nil {
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
@@ -337,15 +370,20 @@ func (c *Client) ChatComplete(
 func (c *Client) ChatStream(
 	ctx context.Context,
 	messages []Message,
+	opts ...ChatOption,
 ) (<-chan StreamChunk, error) {
 	temp := 0.0
-	body, err := json.Marshal(chatRequest{
+	cr := chatRequest{
 		Model:       c.model,
 		Messages:    messages,
 		Stream:      true,
 		Temperature: &temp,
 		Options:     c.requestOptions(),
-	})
+	}
+	for _, opt := range opts {
+		opt(&cr)
+	}
+	body, err := json.Marshal(cr)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}

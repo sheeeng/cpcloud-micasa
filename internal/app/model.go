@@ -30,6 +30,8 @@ const (
 	keyEsc   = "esc"
 	keyEnter = "enter"
 	keyDown  = "down"
+	keyLeft  = "left"
+	keyRight = "right"
 	keyCtrlN = "ctrl+n"
 )
 
@@ -489,7 +491,7 @@ func (m *Model) handleDashboardKeys(key tea.KeyMsg) (tea.Cmd, bool) {
 	case "tab":
 		// Block house profile toggle on dashboard.
 		return nil, true
-	case "h", "l", "left", "right":
+	case "h", "l", keyLeft, keyRight:
 		// Block column movement on dashboard.
 		return nil, true
 	case "s", "S", "c", "C", "i", "/", "n", "N", "!":
@@ -536,13 +538,13 @@ func (m *Model) handleCommonKeys(key tea.KeyMsg) (tea.Cmd, bool) {
 			m.updateTabViewport(tab)
 		}
 		return nil, true
-	case "h", "left":
+	case "h", keyLeft:
 		if tab := m.effectiveTab(); tab != nil {
 			tab.ColCursor = nextVisibleCol(tab.Specs, tab.ColCursor, false)
 			m.updateTabViewport(tab)
 		}
 		return nil, true
-	case "l", "right":
+	case "l", keyRight:
 		if tab := m.effectiveTab(); tab != nil {
 			tab.ColCursor = nextVisibleCol(tab.Specs, tab.ColCursor, true)
 			m.updateTabViewport(tab)
@@ -792,9 +794,9 @@ func (m *Model) handleEditKeys(key tea.KeyMsg) (tea.Cmd, bool) {
 
 func (m *Model) handleCalendarKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
-	case "h", "left":
+	case "h", keyLeft:
 		calendarMove(m.calendar, -1)
-	case "l", "right":
+	case "l", keyRight:
 		calendarMove(m.calendar, 1)
 	case "j", keyDown:
 		calendarMove(m.calendar, 7)
@@ -1940,6 +1942,11 @@ func (m *Model) clearPullState() {
 }
 
 func (m *Model) saveForm() tea.Cmd {
+	// Deferred document creation: hold doc in memory, open extraction overlay.
+	if fd, ok := m.formData.(*documentFormData); ok && fd.DeferCreate {
+		return m.saveDeferredDocumentForm()
+	}
+
 	isFirstHouse := m.formKind == formHouse && !m.hasHouse
 	m.snapshotForUndo()
 	kind := m.formKind
@@ -1962,6 +1969,10 @@ func (m *Model) saveForm() tea.Cmd {
 // saveFormInPlace persists the form data without closing the form,
 // so the user can continue editing after a Ctrl+S save.
 func (m *Model) saveFormInPlace() tea.Cmd {
+	// Deferred creation: Ctrl+S acts the same as Enter for quick-add.
+	if fd, ok := m.formData.(*documentFormData); ok && fd.DeferCreate {
+		return m.saveDeferredDocumentForm()
+	}
 	m.snapshotForUndo()
 	kind := m.formKind
 	isCreate := m.editID == nil
@@ -1988,6 +1999,41 @@ func (m *Model) afterDocumentSaveIfNeeded(kind FormKind) tea.Cmd {
 		return nil
 	}
 	return m.afterDocumentSave()
+}
+
+// saveDeferredDocumentForm parses the quick-add form, holds the document in
+// memory, and opens the extraction overlay. The document is not created in the
+// database until the user accepts the extraction results.
+func (m *Model) saveDeferredDocumentForm() tea.Cmd {
+	result, err := m.parseDocumentFormData()
+	if err != nil {
+		m.setStatusError(err.Error())
+		return nil
+	}
+	doc := result.Doc
+	m.exitForm()
+
+	cmd := m.startExtractionOverlay(
+		0, // no DB ID yet
+		doc.FileName,
+		doc.Data,
+		doc.MIMEType,
+		doc.ExtractedText,
+	)
+	if cmd == nil {
+		// No extraction steps needed. Create the document immediately.
+		if err := m.store.CreateDocument(&doc); err != nil {
+			m.setStatusError(err.Error())
+			return nil
+		}
+		m.reloadAfterMutation()
+		return nil
+	}
+	m.extraction.pendingDoc = &doc
+	if result.ExtractErr != nil {
+		m.setStatusInfo(fmt.Sprintf("extraction incomplete: %s", result.ExtractErr))
+	}
+	return cmd
 }
 
 // reloadAfterFormSave picks the minimal reload strategy based on which
