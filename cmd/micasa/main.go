@@ -168,6 +168,10 @@ func (cmd *runCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("initialize app: %w", err)
 	}
+	// Push current title onto the terminal's title stack, set ours, pop on exit.
+	fmt.Fprint(os.Stderr, "\033[22;2t\033]2;micasa\007")
+	defer fmt.Fprint(os.Stderr, "\033[23;2t")
+
 	_, err = tea.NewProgram(model, tea.WithAltScreen()).Run()
 	return err
 }
