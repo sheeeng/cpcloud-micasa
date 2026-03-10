@@ -239,6 +239,12 @@ func (maintenanceHandler) SyncFixedValues(m *Model, specs []columnSpec) {
 		catNames[i] = c.Name
 	}
 	setFixedValues(specs, "Category", catNames)
+	setFixedValues(specs, "Season", []string{
+		data.SeasonSpring,
+		data.SeasonSummer,
+		data.SeasonFall,
+		data.SeasonWinter,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +436,7 @@ func newApplianceMaintenanceHandler(applianceID uint) scopedHandler {
 			rows, meta, cellRows := applianceMaintenanceRows(items, logCounts, docCounts)
 			return rows, meta, cellRows, nil
 		},
-		inlineEditFn: skipColEdit(parent, 3), // skip Appliance column
+		inlineEditFn: skipColEdit(parent, int(maintenanceColAppliance)), // skip Appliance column
 	}
 }
 

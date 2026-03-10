@@ -422,11 +422,71 @@ func TestMaintenanceHandlerSyncFixedValues(t *testing.T) {
 	h := maintenanceHandler{}
 	specs := []columnSpec{
 		{Title: "Category"},
+		{Title: "Season"},
 		{Title: "Item"},
 	}
 	h.SyncFixedValues(m, specs)
 
 	assert.NotEmpty(t, specs[0].FixedValues, "expected FixedValues for Category column")
+	assert.NotEmpty(t, specs[1].FixedValues, "expected FixedValues for Season column")
+	assert.Equal(t, []string{
+		data.SeasonSpring,
+		data.SeasonSummer,
+		data.SeasonFall,
+		data.SeasonWinter,
+	}, specs[1].FixedValues)
+}
+
+func TestMaintenanceHandlerCreateWithSeasonRoundTrip(t *testing.T) {
+	t.Parallel()
+	m := newTestModelWithStore(t)
+	h := maintenanceHandler{}
+	cats, _ := m.store.MaintenanceCategories()
+
+	m.fs.formData = &maintenanceFormData{
+		Name:       "Winterize Sprinklers",
+		CategoryID: cats[0].ID,
+		Season:     data.SeasonFall,
+	}
+	require.NoError(t, h.SubmitForm(m))
+
+	_, _, cells, err := h.Load(m.store, false)
+	require.NoError(t, err)
+	require.Len(t, cells, 1)
+	seasonCell := cells[0][int(maintenanceColSeason)]
+	assert.Equal(t, data.SeasonFall, seasonCell.Value)
+	assert.Equal(t, cellStatus, seasonCell.Kind)
+}
+
+func TestMaintenanceHandlerEditSeasonRoundTrip(t *testing.T) {
+	t.Parallel()
+	m := newTestModelWithStore(t)
+	h := maintenanceHandler{}
+	cats, _ := m.store.MaintenanceCategories()
+
+	m.fs.formData = &maintenanceFormData{
+		Name:       "Clean Gutters",
+		CategoryID: cats[0].ID,
+		Season:     data.SeasonSpring,
+	}
+	require.NoError(t, h.SubmitForm(m))
+	_, meta, _, _ := h.Load(m.store, false)
+	id := meta[0].ID
+
+	// Edit to change season.
+	editID := id
+	m.fs.editID = &editID
+	m.fs.formData = &maintenanceFormData{
+		Name:       "Clean Gutters",
+		CategoryID: cats[0].ID,
+		Season:     data.SeasonWinter,
+	}
+	require.NoError(t, h.SubmitForm(m))
+	m.fs.editID = nil
+
+	item, err := m.store.GetMaintenance(id)
+	require.NoError(t, err)
+	assert.Equal(t, data.SeasonWinter, item.Season)
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +988,43 @@ func TestApplianceMaintenanceHandlerLoad(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.NotZero(t, meta[0].ID)
+}
+
+func TestApplianceMaintenanceInlineEditSeasonDispatchesCorrectly(t *testing.T) {
+	t.Parallel()
+	m := newTestModelWithStore(t)
+	cats, _ := m.store.MaintenanceCategories()
+
+	require.NoError(t, m.store.CreateAppliance(&data.Appliance{Name: "Furnace"}))
+	apps, _ := m.store.ListAppliances(false)
+	appID := apps[0].ID
+
+	require.NoError(t, m.store.CreateMaintenance(&data.MaintenanceItem{
+		Name:        "Replace Filter",
+		CategoryID:  cats[0].ID,
+		ApplianceID: &appID,
+		Season:      data.SeasonFall,
+	}))
+
+	h := newApplianceMaintenanceHandler(appID)
+	_, meta, _, err := h.Load(m.store, false)
+	require.NoError(t, err)
+	id := meta[0].ID
+
+	// In the sub-table (Appliance column removed), Season is at sub-table
+	// index 3. Since that's below the skipAt (maintenanceColAppliance),
+	// skipColEdit passes it through to maintenanceColSeason in the full table.
+	m.exitForm()
+	m.closeInlineInput()
+	require.NoError(t, h.InlineEdit(m, id, 3))
+	assert.Equal(t, modeForm, m.mode)
+
+	// Verify the form opened for season, not appliance:
+	// the form data should reflect the current season value.
+	fd, ok := m.fs.formData.(*maintenanceFormData)
+	require.True(t, ok)
+	assert.Equal(t, data.SeasonFall, fd.Season,
+		"inline edit on sub-table col 3 should dispatch to Season, not Appliance")
 }
 
 // ---------------------------------------------------------------------------
