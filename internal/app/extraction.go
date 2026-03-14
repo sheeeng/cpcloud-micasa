@@ -258,9 +258,17 @@ func (m *Model) startExtractionOverlay(
 	fileData []byte,
 	mime string,
 	extractedText string,
+	extractData []byte,
 ) tea.Cmd {
 	needsExtract := extract.NeedsOCR(m.ex.extractors, mime)
 	needsLLM := m.extractionLLMClient() != nil
+
+	// Skip OCR when the document already has extracted text from a
+	// previous run -- feed existing text directly to the LLM.
+	hasExistingText := strings.TrimSpace(extractedText) != ""
+	if hasExistingText {
+		needsExtract = false
+	}
 
 	if !needsExtract && !needsLLM {
 		return nil
@@ -274,12 +282,14 @@ func (m *Model) startExtractionOverlay(
 		context.Background(),
 	)
 
-	// Text extraction only applies to PDFs and text files; skip for images.
-	hasText := !extract.IsImageMIME(mime)
+	// Text extraction only applies to PDFs and text files -- unless
+	// we already have text from a previous extraction (e.g. prior OCR
+	// on an image), in which case we show the cached text.
+	hasText := !extract.IsImageMIME(mime) || hasExistingText
 
 	// Build initial text source from already-extracted text.
 	var sources []extract.TextSource
-	if hasText && strings.TrimSpace(extractedText) != "" {
+	if hasText && hasExistingText {
 		var tool, desc string
 		switch {
 		case mime == extract.MIMEApplicationPDF:
@@ -288,6 +298,9 @@ func (m *Model) startExtractionOverlay(
 		case strings.HasPrefix(mime, "text/"):
 			tool = "plaintext"
 			desc = "Plain text content."
+		case extract.IsImageMIME(mime):
+			tool = "tesseract"
+			desc = "Text from previous OCR extraction."
 		default:
 			tool = mime
 		}
@@ -295,6 +308,7 @@ func (m *Model) startExtractionOverlay(
 			Tool: tool,
 			Desc: desc,
 			Text: extractedText,
+			Data: extractData,
 		})
 	}
 
@@ -325,6 +339,8 @@ func (m *Model) startExtractionOverlay(
 			textTool = "pdf"
 		case strings.HasPrefix(mime, "text/"):
 			textTool = "plaintext"
+		case extract.IsImageMIME(mime):
+			textTool = "ocr"
 		default:
 			textTool = mime
 		}
@@ -869,6 +885,12 @@ func (m *Model) acceptDeferredExtraction() error {
 	if len(ex.pendingData) > 0 {
 		doc.ExtractData = ex.pendingData
 	}
+	doc.ExtractionModel = m.extractionModelUsed(ex)
+	ops, err := marshalOps(ex.operations)
+	if err != nil {
+		return fmt.Errorf("marshal extraction ops: %w", err)
+	}
+	doc.ExtractionOps = ops
 
 	if err := m.store.CreateDocument(doc); err != nil {
 		return fmt.Errorf("create document: %w", err)
@@ -893,11 +915,16 @@ func (m *Model) acceptDeferredExtraction() error {
 func (m *Model) acceptExistingExtraction() error {
 	ex := m.ex.extraction
 
-	// Persist async extraction results.
-	if ex.pendingText != "" || len(ex.pendingData) > 0 {
+	// Persist async extraction results and the model that produced them.
+	if ex.pendingText != "" || len(ex.pendingData) > 0 || ex.hasLLM {
 		if m.store != nil {
+			model := m.extractionModelUsed(ex)
+			ops, err := marshalOps(ex.operations)
+			if err != nil {
+				return fmt.Errorf("marshal extraction ops: %w", err)
+			}
 			if err := m.store.UpdateDocumentExtraction(
-				ex.DocID, ex.pendingText, ex.pendingData,
+				ex.DocID, ex.pendingText, ex.pendingData, model, ops,
 			); err != nil {
 				return fmt.Errorf("save extraction: %w", err)
 			}
@@ -1949,6 +1976,30 @@ func stepName(si extractionStep) string {
 	return "?"
 }
 
+// marshalOps serialises extraction operations to JSON for persistence.
+// A nil slice (LLM didn't run / failed) returns nil so callers skip
+// the update. A non-nil but empty slice (LLM ran, zero ops) returns
+// "[]" so stale data is cleared.
+func marshalOps(ops []extract.Operation) ([]byte, error) {
+	if ops == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(ops)
+	if err != nil {
+		return nil, fmt.Errorf("marshal ops: %w", err)
+	}
+	return b, nil
+}
+
+// extractionModelUsed returns the model name if the LLM step completed
+// successfully, or empty string if LLM was skipped or failed.
+func (m *Model) extractionModelUsed(ex *extractionLogState) string {
+	if ex.hasLLM && ex.Steps[stepLLM].Status == stepDone {
+		return m.extractionModelLabel()
+	}
+	return ""
+}
+
 // extractionModelLabel returns the model name used for extraction.
 func (m *Model) extractionModelLabel() string {
 	if m.ex.extractionModel != "" {
@@ -1999,9 +2050,9 @@ func previewColumns(tableName string, cur locale.Currency) []previewColDef {
 	case tableDocuments:
 		s := documentColumnSpecs()
 		return []previewColDef{
-			{data.ColTitle, s[1], fmtAnyText},
-			{data.ColMIMEType, s[3], fmtAnyText},
-			{data.ColNotes, s[5], fmtAnyText},
+			{data.ColTitle, s[documentColTitle], fmtAnyText},
+			{data.ColMIMEType, s[documentColType], fmtAnyText},
+			{data.ColNotes, s[documentColNotes], fmtAnyText},
 		}
 	case data.TableQuotes:
 		s := quoteColumnSpecs()

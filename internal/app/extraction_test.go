@@ -847,6 +847,219 @@ func TestNeedsOCR_UsedInsteadOfHardcodedToolName(t *testing.T) {
 	assert.Nil(t, m.ex.extractors, "default test model has no extractors")
 }
 
+// --- Extract keybinding and OCR skip (#711) ---
+
+func TestExtractKeybinding_OpensOverlayOnDocumentTab(t *testing.T) {
+	t.Parallel()
+	m := newTestModelWithStore(t)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	// Create a document with existing extracted text.
+	require.NoError(t, m.store.CreateDocument(&data.Document{
+		Title:         "Receipt",
+		FileName:      "receipt.png",
+		MIMEType:      "image/png",
+		Data:          []byte("fake-image"),
+		ExtractedText: "Previously extracted invoice text",
+	}))
+
+	// Navigate to Documents tab, reload, enter edit mode.
+	m.active = tabIndex(tabDocuments)
+	m.reloadAfterMutation()
+	sendKey(m, "i")
+	require.Equal(t, modeEdit, m.mode)
+
+	// Press r to extract the selected document.
+	sendKey(m, "r")
+
+	require.NotNil(t, m.ex.extraction, "extraction overlay should be open")
+	ex := m.ex.extraction
+	assert.True(t, ex.hasText, "should show text step with cached text")
+	assert.False(t, ex.hasExtract, "should skip OCR -- text already exists")
+	assert.True(t, ex.hasLLM, "should proceed to LLM")
+	assert.Equal(t, "receipt.png", ex.Filename)
+}
+
+func TestExtractKeybinding_NoOpOnNonDocumentTab(t *testing.T) {
+	t.Parallel()
+	m := newTestModelWithStore(t)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	// Stay on the default tab (not documents).
+	sendKey(m, "i")
+	sendKey(m, "r")
+
+	assert.Nil(t, m.ex.extraction, "r should not open extraction on non-document tab")
+}
+
+func TestExtractKeybinding_RunsOCRWhenNoExistingText(t *testing.T) {
+	t.Parallel()
+	m := newTestModelWithStore(t)
+	m.ex.extractors = extract.DefaultExtractors(0, 0, true)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	if !extract.NeedsOCR(m.ex.extractors, "image/png") {
+		t.Skip("OCR tools not available")
+	}
+
+	// Create a document without extracted text.
+	require.NoError(t, m.store.CreateDocument(&data.Document{
+		Title:    "New Receipt",
+		FileName: "new.png",
+		MIMEType: "image/png",
+		Data:     []byte("fake-image"),
+	}))
+
+	m.active = tabIndex(tabDocuments)
+	m.reloadAfterMutation()
+	sendKey(m, "i")
+	sendKey(m, "r")
+
+	require.NotNil(t, m.ex.extraction)
+	ex := m.ex.extraction
+	assert.True(t, ex.hasExtract, "should run OCR when no existing text")
+}
+
+// --- startExtractionOverlay unit tests (#711) ---
+
+func TestStartExtraction_ImageWithExistingText_SkipsOCR(t *testing.T) {
+	t.Parallel()
+	m := newTestModel(t)
+	m.ex.extractors = extract.DefaultExtractors(0, 0, true)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	existingText := "Previously extracted invoice text"
+	cmd := m.startExtractionOverlay(
+		1, "receipt.png", []byte("fake"), "image/png", existingText, nil,
+	)
+
+	require.NotNil(t, cmd, "should return a command for LLM step")
+	require.NotNil(t, m.ex.extraction)
+
+	ex := m.ex.extraction
+	assert.True(t, ex.hasText, "image with existing text should show text step")
+	assert.False(t, ex.hasExtract, "existing text should skip OCR")
+	assert.True(t, ex.hasLLM, "should proceed to LLM")
+	assert.Equal(t, stepDone, ex.Steps[stepText].Status)
+	assert.Equal(t, "ocr", ex.Steps[stepText].Detail)
+	require.Len(t, ex.sources, 1)
+	assert.Equal(t, "tesseract", ex.sources[0].Tool)
+	assert.Equal(t, "Text from previous OCR extraction.", ex.sources[0].Desc)
+	assert.Equal(t, existingText, ex.sources[0].Text)
+}
+
+func TestStartExtraction_PDFWithExistingText_SkipsOCR(t *testing.T) {
+	t.Parallel()
+	m := newTestModel(t)
+	m.ex.extractors = extract.DefaultExtractors(0, 0, true)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	existingText := "Invoice #12345\nTotal: $100.00"
+	cmd := m.startExtractionOverlay(
+		1, "invoice.pdf", []byte("fake-pdf"), extract.MIMEApplicationPDF, existingText, nil,
+	)
+
+	require.NotNil(t, cmd)
+	require.NotNil(t, m.ex.extraction)
+
+	ex := m.ex.extraction
+	assert.True(t, ex.hasText)
+	assert.False(t, ex.hasExtract, "existing text should skip OCR even for PDFs")
+	assert.True(t, ex.hasLLM)
+	assert.Equal(t, stepDone, ex.Steps[stepText].Status)
+	assert.Equal(t, "pdf", ex.Steps[stepText].Detail)
+	require.Len(t, ex.sources, 1)
+	assert.Equal(t, "pdftotext", ex.sources[0].Tool)
+	assert.Equal(t, existingText, ex.sources[0].Text)
+}
+
+func TestStartExtraction_ExistingTextPreservesExtractData(t *testing.T) {
+	t.Parallel()
+	m := newTestModel(t)
+	m.ex.extractors = extract.DefaultExtractors(0, 0, true)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	existingText := "OCR result from previous run"
+	tsvData := []byte("level\tpage\tblock\n1\t1\t1\n")
+	cmd := m.startExtractionOverlay(
+		1, "receipt.png", []byte("fake"), "image/png", existingText, tsvData,
+	)
+
+	require.NotNil(t, cmd)
+	require.NotNil(t, m.ex.extraction)
+
+	ex := m.ex.extraction
+	require.Len(t, ex.sources, 1)
+	assert.Equal(t, tsvData, ex.sources[0].Data, "extract data should be preserved in source")
+}
+
+func TestStartExtraction_EmptyText_RunsOCRNormally(t *testing.T) {
+	t.Parallel()
+	m := newTestModel(t)
+	m.ex.extractors = extract.DefaultExtractors(0, 0, true)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	if !extract.NeedsOCR(m.ex.extractors, "image/png") {
+		t.Skip("OCR tools not available")
+	}
+
+	cmd := m.startExtractionOverlay(
+		1, "receipt.png", []byte("fake"), "image/png", "", nil,
+	)
+
+	require.NotNil(t, cmd)
+	require.NotNil(t, m.ex.extraction)
+
+	ex := m.ex.extraction
+	assert.False(t, ex.hasText, "images without existing text should not show text step")
+	assert.True(t, ex.hasExtract, "OCR should run when no existing text")
+	assert.True(t, ex.hasLLM)
+	assert.Equal(t, stepRunning, ex.Steps[stepExtract].Status)
+}
+
+func TestStartExtraction_WhitespaceOnlyText_RunsOCR(t *testing.T) {
+	t.Parallel()
+	m := newTestModel(t)
+	m.ex.extractors = extract.DefaultExtractors(0, 0, true)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	if !extract.NeedsOCR(m.ex.extractors, "image/png") {
+		t.Skip("OCR tools not available")
+	}
+
+	cmd := m.startExtractionOverlay(
+		1, "receipt.png", []byte("fake"), "image/png", "   \n\t  ", nil,
+	)
+
+	require.NotNil(t, cmd)
+	require.NotNil(t, m.ex.extraction)
+
+	ex := m.ex.extraction
+	assert.True(t, ex.hasExtract, "whitespace-only text should still trigger OCR")
+}
+
+func TestStartExtraction_PlainTextWithExistingText_SkipsToLLM(t *testing.T) {
+	t.Parallel()
+	m := newTestModel(t)
+	m.ex.extractionClient = testExtractionOllamaClient(t, "test-model")
+
+	existingText := "Some previously extracted content"
+	cmd := m.startExtractionOverlay(
+		1, "notes.txt", []byte("fake"), "text/plain", existingText, nil,
+	)
+
+	require.NotNil(t, cmd)
+	require.NotNil(t, m.ex.extraction)
+
+	ex := m.ex.extraction
+	assert.True(t, ex.hasText)
+	assert.False(t, ex.hasExtract)
+	assert.True(t, ex.hasLLM)
+	assert.Equal(t, "plaintext", ex.Steps[stepText].Detail)
+	require.Len(t, ex.sources, 1)
+	assert.Equal(t, "plaintext", ex.sources[0].Tool)
+}
+
 // --- Background extraction ---
 
 func TestBackground_CtrlBMovesExtractionToBg(t *testing.T) {
@@ -2921,6 +3134,63 @@ func TestExtractionTSVToggle_StatusMessage(t *testing.T) {
 	assert.Contains(t, m.status.Text, "layout off")
 }
 
+// ---------------------------------------------------------------------------
+// extractionModelUsed tests
+// ---------------------------------------------------------------------------
+
+func TestExtractionModelUsed_ReturnsModelWhenLLMSucceeded(t *testing.T) {
+	t.Parallel()
+	m := newExtractionModel(t, map[extractionStep]stepStatus{
+		stepText:    stepDone,
+		stepExtract: stepDone,
+		stepLLM:     stepDone,
+	})
+	m.ex.extractionModel = "test-extraction-model"
+
+	result := m.extractionModelUsed(m.ex.extraction)
+	assert.Equal(t, "test-extraction-model", result)
+}
+
+func TestExtractionModelUsed_FallsBackToChatModel(t *testing.T) {
+	t.Parallel()
+	m := newExtractionModel(t, map[extractionStep]stepStatus{
+		stepText:    stepDone,
+		stepExtract: stepDone,
+		stepLLM:     stepDone,
+	})
+	m.ex.extractionModel = ""
+	m.llmClient = testExtractionOllamaClient(t, "chat-model")
+
+	result := m.extractionModelUsed(m.ex.extraction)
+	assert.Equal(t, "chat-model", result)
+}
+
+func TestExtractionModelUsed_EmptyWhenLLMSkipped(t *testing.T) {
+	t.Parallel()
+	m := newExtractionModel(t, map[extractionStep]stepStatus{
+		stepText:    stepDone,
+		stepExtract: stepDone,
+	})
+	ex := m.ex.extraction
+	ex.hasLLM = false
+
+	result := m.extractionModelUsed(ex)
+	assert.Empty(t, result)
+}
+
+func TestExtractionModelUsed_EmptyWhenLLMFailed(t *testing.T) {
+	t.Parallel()
+	m := newExtractionModel(t, map[extractionStep]stepStatus{
+		stepText:    stepDone,
+		stepExtract: stepDone,
+		stepLLM:     stepFailed,
+	})
+	m.ex.extractionModel = "test-model"
+
+	result := m.extractionModelUsed(m.ex.extraction)
+	assert.Empty(t, result)
+}
+
 func TestExtractionTSVToggle_HintShownInFooter(t *testing.T) {
 	t.Parallel()
 	m := newExtractionModel(t, map[extractionStep]stepStatus{
@@ -2935,4 +3205,28 @@ func TestExtractionTSVToggle_HintShownInFooter(t *testing.T) {
 
 	view := m.View()
 	assert.Contains(t, view, "layout", "footer should show layout hint when done with LLM")
+}
+
+func TestMarshalOps_NilSlice(t *testing.T) {
+	t.Parallel()
+	b, err := marshalOps(nil)
+	require.NoError(t, err)
+	assert.Nil(t, b, "nil input should produce nil output (no-update sentinel)")
+}
+
+func TestMarshalOps_EmptySlice(t *testing.T) {
+	t.Parallel()
+	b, err := marshalOps([]extract.Operation{})
+	require.NoError(t, err)
+	assert.Equal(t, []byte("[]"), b, "empty non-nil slice should serialize to []")
+}
+
+func TestMarshalOps_WithOps(t *testing.T) {
+	t.Parallel()
+	ops := []extract.Operation{
+		{Action: "upsert", Table: "projects", Data: map[string]any{"title": "Test"}},
+	}
+	b, err := marshalOps(ops)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"action":"upsert"`)
 }

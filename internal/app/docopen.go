@@ -6,6 +6,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 
@@ -44,6 +45,34 @@ func (m *Model) openSelectedDocument() tea.Cmd {
 	}
 
 	return openFileCmd(cachePath)
+}
+
+// extractSelectedDocument loads the selected document and opens the extraction
+// overlay. Only operates on document tabs; returns nil on other tabs.
+func (m *Model) extractSelectedDocument() tea.Cmd {
+	if !m.effectiveTab().isDocumentTab() {
+		return nil
+	}
+
+	meta, ok := m.selectedRowMeta()
+	if !ok || meta.Deleted {
+		return nil
+	}
+
+	doc, err := m.store.GetDocument(meta.ID)
+	if err != nil {
+		m.setStatusError(fmt.Sprintf("load document: %s", err))
+		return nil
+	}
+
+	cmd := m.startExtractionOverlay(
+		doc.ID, doc.FileName, doc.Data, doc.MIMEType, doc.ExtractedText, doc.ExtractData,
+	)
+	if cmd == nil {
+		m.setStatusError("no extraction tools or LLM configured")
+		return nil
+	}
+	return cmd
 }
 
 // openFileCmd returns a tea.Cmd that opens the given path with the OS viewer.
@@ -88,23 +117,48 @@ func openFileCmd(path string) tea.Cmd {
 }
 
 // wrapOpenerError adds an actionable hint when the OS file-opener command
-// is missing or cannot be found.
+// is missing or fails (e.g. headless/remote server with no display).
 func wrapOpenerError(err error, openerName string) error {
-	if !errors.Is(err, exec.ErrNotFound) {
-		return err
+	if errors.Is(err, exec.ErrNotFound) {
+		switch openerName {
+		case "xdg-open":
+			return fmt.Errorf(
+				"%s not found -- install xdg-utils (e.g. apt install xdg-utils)",
+				openerName,
+			)
+		case "open":
+			return fmt.Errorf(
+				"%s not found -- expected on macOS; is this a headless environment?",
+				openerName,
+			)
+		default:
+			return fmt.Errorf("%s not found -- no file opener available", openerName)
+		}
 	}
-	switch openerName {
-	case "xdg-open":
+
+	// The opener command exists but exited non-zero. On headless/remote
+	// machines (no display server) this is the typical failure mode.
+	// Detect it and surface an actionable message.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if openerName == "xdg-open" && !hasDisplay() {
+			return fmt.Errorf(
+				"%s failed -- no display server (DISPLAY/WAYLAND_DISPLAY not set); "+
+					"running on a remote or headless machine?",
+				openerName,
+			)
+		}
 		return fmt.Errorf(
-			"%s not found -- install xdg-utils (e.g. apt install xdg-utils)",
-			openerName,
+			"%s failed (exit code %d) -- is a graphical environment available?",
+			openerName, exitErr.ExitCode(),
 		)
-	case "open":
-		return fmt.Errorf(
-			"%s not found -- expected on macOS; is this a headless environment?",
-			openerName,
-		)
-	default:
-		return fmt.Errorf("%s not found -- no file opener available", openerName)
 	}
+
+	return err
+}
+
+// hasDisplay reports whether a graphical display appears to be available
+// by checking the standard X11 and Wayland environment variables.
+func hasDisplay() bool {
+	return os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != ""
 }

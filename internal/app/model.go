@@ -914,6 +914,10 @@ func (m *Model) handleEditKeys(key tea.KeyMsg) (tea.Cmd, bool) {
 		if cmd := m.openSelectedDocument(); cmd != nil {
 			return cmd, true
 		}
+	case keyR:
+		if cmd := m.extractSelectedDocument(); cmd != nil {
+			return cmd, true
+		}
 	case keyX:
 		m.toggleShowDeleted()
 		return nil, true
@@ -2032,7 +2036,7 @@ func (m *Model) handlePullProgress(msg pullProgressMsg) tea.Cmd {
 				m.setStatusError("load document for extraction: " + err.Error())
 			} else {
 				return m.startExtractionOverlay(
-					docID, doc.FileName, doc.Data, doc.MIMEType, doc.ExtractedText,
+					docID, doc.FileName, doc.Data, doc.MIMEType, doc.ExtractedText, doc.ExtractData,
 				)
 			}
 		}
@@ -2127,8 +2131,12 @@ func (m *Model) afterDocumentSave() tea.Cmd {
 	// Check if LLM extraction is configured and ready.
 	llmReady := m.ex.extractionEnabled && m.extractionLLMClient() != nil && m.ex.extractionReady
 
-	// Determine if async extraction is needed.
+	// Determine if async extraction is needed. Skip OCR when the
+	// document already has extracted text from a previous run.
 	needsExtract := extract.NeedsOCR(m.ex.extractors, meta.MIMEType)
+	if strings.TrimSpace(meta.ExtractedText) != "" {
+		needsExtract = false
+	}
 
 	// If nothing async is needed, bail early.
 	if !needsExtract && !llmReady {
@@ -2156,6 +2164,7 @@ func (m *Model) afterDocumentSave() tea.Cmd {
 		doc.Data,
 		doc.MIMEType,
 		doc.ExtractedText,
+		doc.ExtractData,
 	)
 }
 
@@ -2275,6 +2284,7 @@ func (m *Model) saveDeferredDocumentForm() tea.Cmd {
 		doc.Data,
 		doc.MIMEType,
 		doc.ExtractedText,
+		doc.ExtractData,
 	)
 	if cmd == nil {
 		// No extraction steps needed. Create the document immediately.
