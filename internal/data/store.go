@@ -889,6 +889,25 @@ func (s *Store) UpdateAppliance(item Appliance) error {
 // ServiceLogEntry CRUD
 // ---------------------------------------------------------------------------
 
+// syncLastServiced sets a maintenance item's LastServicedAt to the most recent
+// ServicedAt from its non-deleted service log entries. If no entries exist the
+// field is left unchanged, preserving any manually-set value.
+func syncLastServiced(tx *gorm.DB, maintenanceItemID uint) error {
+	var latest ServiceLogEntry
+	err := tx.Where(ColMaintenanceItemID+" = ?", maintenanceItemID).
+		Order(ColServicedAt + " desc, " + ColID + " desc").
+		First(&latest).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Model(&MaintenanceItem{}).
+		Where(ColID+" = ?", maintenanceItemID).
+		Update(ColLastServicedAt, latest.ServicedAt).Error
+}
+
 func (s *Store) ListServiceLog(
 	maintenanceItemID uint,
 	includeDeleted bool,
@@ -915,12 +934,20 @@ func (s *Store) CreateServiceLog(entry *ServiceLogEntry, vendor Vendor) error {
 			}
 			entry.VendorID = &found.ID
 		}
-		return tx.Create(entry).Error
+		if err := tx.Create(entry).Error; err != nil {
+			return err
+		}
+		return syncLastServiced(tx, entry.MaintenanceItemID)
 	})
 }
 
 func (s *Store) UpdateServiceLog(entry ServiceLogEntry, vendor Vendor) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
+		// Fetch old entry to detect parent change.
+		var old ServiceLogEntry
+		if err := tx.First(&old, entry.ID).Error; err != nil {
+			return err
+		}
 		if strings.TrimSpace(vendor.Name) != "" {
 			found, err := findOrCreateVendor(tx, vendor)
 			if err != nil {
@@ -930,12 +957,30 @@ func (s *Store) UpdateServiceLog(entry ServiceLogEntry, vendor Vendor) error {
 		} else {
 			entry.VendorID = nil
 		}
-		return updateByIDWith(tx, &ServiceLogEntry{}, entry.ID, entry)
+		if err := updateByIDWith(tx, &ServiceLogEntry{}, entry.ID, entry); err != nil {
+			return err
+		}
+		// If the entry moved to a different parent, sync both.
+		if old.MaintenanceItemID != entry.MaintenanceItemID {
+			if err := syncLastServiced(tx, old.MaintenanceItemID); err != nil {
+				return err
+			}
+		}
+		return syncLastServiced(tx, entry.MaintenanceItemID)
 	})
 }
 
 func (s *Store) DeleteServiceLog(id uint) error {
-	return s.softDelete(&ServiceLogEntry{}, DeletionEntityServiceLog, id)
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var entry ServiceLogEntry
+		if err := tx.First(&entry, id).Error; err != nil {
+			return err
+		}
+		if err := softDeleteWith(tx, &ServiceLogEntry{}, DeletionEntityServiceLog, id); err != nil {
+			return err
+		}
+		return syncLastServiced(tx, entry.MaintenanceItemID)
+	})
 }
 
 func (s *Store) RestoreServiceLog(id uint) error {
@@ -949,7 +994,12 @@ func (s *Store) RestoreServiceLog(id uint) error {
 	}); err != nil {
 		return err
 	}
-	return s.restoreEntity(&ServiceLogEntry{}, DeletionEntityServiceLog, id)
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := restoreSoftDeleted(tx, &ServiceLogEntry{}, DeletionEntityServiceLog, id); err != nil {
+			return err
+		}
+		return syncLastServiced(tx, entry.MaintenanceItemID)
+	})
 }
 
 // CountServiceLogs returns the number of non-deleted service log entries per
@@ -1465,21 +1515,25 @@ func (s *Store) countDependents(model any, fkColumn string, id uint) (int64, err
 	return count, err
 }
 
+func softDeleteWith(tx *gorm.DB, model any, entity string, id uint) error {
+	result := tx.Delete(model, id)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	record := DeletionRecord{
+		Entity:    entity,
+		TargetID:  id,
+		DeletedAt: time.Now(),
+	}
+	return tx.Create(&record).Error
+}
+
 func (s *Store) softDelete(model any, entity string, id uint) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
-		result := tx.Delete(model, id)
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected == 0 {
-			return gorm.ErrRecordNotFound
-		}
-		record := DeletionRecord{
-			Entity:    entity,
-			TargetID:  id,
-			DeletedAt: time.Now(),
-		}
-		return tx.Create(&record).Error
+		return softDeleteWith(tx, model, entity, id)
 	})
 }
 
