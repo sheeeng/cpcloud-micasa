@@ -137,8 +137,10 @@ func (m *Model) promptHardDelete() {
 	}
 	switch tab.Kind {
 	case tabIncidents, tabMaintenance:
-	default:
+	case tabProjects, tabQuotes, tabAppliances, tabVendors, tabDocuments:
 		return
+	default:
+		panic(fmt.Sprintf("unhandled TabKind: %d", tab.Kind))
 	}
 	meta, ok := m.selectedRowMeta()
 	if !ok {
